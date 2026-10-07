@@ -1,0 +1,83 @@
+name: Build iOS IPA (unsigned)
+
+# Genera un IPA sin firmar para instalarlo por sideload (SideStore / AltStore / Sideloadly),
+# que lo vuelven a firmar con tu Apple ID. No incluye juegos, claves ni firmware.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Directory.*'
+      - 'global.json'
+      - 'nuget.config'
+      - '.github/workflows/build-ios.yml'
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Select newest Xcode
+        run: |
+          ls /Applications | grep -i '^Xcode' || true
+          XC=$(ls -d /Applications/Xcode_26* 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC/Contents/Developer"; fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/global.json', '**/*.csproj', '**/Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Build emulator core (.NET NativeAOT, ios-arm64)
+        run: dotnet publish src/Ryujinx.Library/Ryujinx.Library.csproj -c Release -r ios-arm64
+
+      - name: Check core library exists where Xcode expects it
+        run: |
+          ls -la src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/
+          test -f src/Ryujinx.Library/bin/Release/net10.0/ios-arm64/native/Ryujinx.Library.dylib
+
+      - name: Build iOS app (unsigned)
+        run: |
+          xcodebuild \
+            -project src/MeloNX/MeloNX.xcodeproj \
+            -scheme MeloNX \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA (keeps entitlements for sideloaders)
+        run: |
+          brew install ldid
+          APP=build/Build/Products/Release-iphoneos/MeloNX.app
+          ldid -S"src/MeloNX/MeloNX/MeloNX.entitlements" "$APP/MeloNX"
+          mkdir -p Payload && cp -R "$APP" Payload/
+          zip -qry MeloNX.ipa Payload
+          ls -lh MeloNX.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeloNX-unsigned-ipa
+          path: MeloNX.ipa
+          retention-days: 14
